@@ -6,7 +6,7 @@ With this setup, I can easily start or stop containers from my phone or tablet u
 
 The scripts use regular WOL packets, but the action depends on the **port** they’re sent to. Depending on the port, the same packet will either **wake up** or **shut down** a container — a little twist on the original idea of WOL. 😄  
 
-## The Script
+## The Scripts
 
 … coming soon
 
