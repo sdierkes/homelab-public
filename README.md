@@ -10,3 +10,4 @@ This repo includes handy scripts and configs for software commonly used in homel
 
 These scripts let you wake up Proxmox VMs and LXC containers using Wake-on-LAN (WoL) packets.  
 The same trick is used for shutdown — by sending WoL packets on a different port.
+For more details see the [proxmox-wol](proxmox-wol/) folder.
