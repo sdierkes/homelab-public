@@ -1,0 +1,17 @@
+[Unit]
+Description=Proxmox Shutdown-on-LAN listener (stop VMs/LXCs)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sol-listener.sh
+Restart=always
+RestartSec=5
+User=root
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sol-listener
+
+[Install]
+WantedBy=multi-user.target
