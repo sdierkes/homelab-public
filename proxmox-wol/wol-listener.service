@@ -1,0 +1,17 @@
+[Unit]
+Description=Proxmox Wake-on-LAN listener (start VMs/LXCs)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/wol-listener.sh
+Restart=always
+RestartSec=5
+User=root
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wol-listener
+
+[Install]
+WantedBy=multi-user.target
