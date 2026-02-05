@@ -247,6 +247,21 @@ sudo journalctl -u wol-listener -f
 sudo journalctl -u sol-listener -f
 ```
 
+## Firewall
+
+To make the scrioty reachable from the local network add firewall rules to the proxmox firewall on the host. The most open rule would be something like:
+
+<img width="50%" height="50%" alt="image" src="https://github.com/user-attachments/assets/793bb077-c51a-4a0c-992f-6966a550b78c" />
+
+Explanation:
+- "Enable" (checkbox)
+- "in"coming traffic
+- and "ACCEPT" the traffic
+- on protocl "udp"
+- from all machines on local network "192.168.178.0/24" (adjust for your local network)
+- on ports "6,9,10,12" (adjust for your needs)
+- set log level to "debug" (for testing, should be redurced later to something like warning) 
+
 ---
 
 ## Notes
