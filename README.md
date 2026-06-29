@@ -28,6 +28,22 @@ For more details see the [cronscript](cronscript) folder
 
 ---
 
+## Backup to USB Drive on TrueNAS SCALE
+
+This guide describes how to set up an automated offsite-style backup from a TrueNAS SCALE pool to an external USB hard drive using ZFS snapshots and replication:
+
+* Creating a ZPool on the USB drive
+* Setting up a daily snapshot task on the source pool
+* Configuring a replication task to mirror snapshots to the USB drive
+* Running the initial replication and verifying success
+* Testing the full export / disconnect / reconnect / import cycle
+* Automating the entire process with a shell script and cron job — the script detects when the USB drive is powered on, imports the pool, runs the replication, and exports the pool again; a 24-hour lock prevents repeated runs if the drive stays connected
+* An explanation of how ZFS snapshots and incremental replication work, including space usage over time and how file additions, modifications, and deletions affect backup drive growth
+
+For more details see the [truenas-usb-backup](truenas-usb-backup/) folder.
+
+---
+
 ## ClamAV on TrueNAS
 
 Here the use of ClamAV within TrueNAS is described:
@@ -37,4 +53,3 @@ Here the use of ClamAV within TrueNAS is described:
 * Advanced configuration with app-per-directory scan, parallelism, etc.  
 
 For more details see the [truenas-clamav](truenas-clamav/) folder.
-
