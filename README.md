@@ -8,7 +8,9 @@ This repo includes handy scripts and configs for software commonly used in homel
 
 ---
 
-## Wake-on-LAN (and Shutdown) for VMs and LXC Containers in Proxmox
+## Proxmox
+
+### Wake-on-LAN (and Shutdown) for VMs and LXC Containers in Proxmox
 
 These scripts let you wake up Proxmox VMs and LXC containers using Wake-on-LAN (WoL) packets.  
 The same trick is used for shutdown — by sending WoL packets on a different port.  
@@ -28,7 +30,9 @@ For more details see the [cronscript](cronscript) folder
 
 ---
 
-## Backup to USB Drive on TrueNAS SCALE
+## TrueNAS
+
+### Backup to USB Drive on TrueNAS SCALE
 
 This guide describes how to set up an automated offsite-style backup from a TrueNAS SCALE pool to an external USB hard drive using ZFS snapshots and replication:
 
@@ -44,7 +48,7 @@ For more details see the [truenas-usb-backup](truenas-usb-backup/) folder.
 
 ---
 
-## ClamAV on TrueNAS
+### ClamAV on TrueNAS
 
 Here the use of ClamAV within TrueNAS is described:
 * Installing the ClamAV app  
