@@ -2,12 +2,11 @@
 # =============================================================================
 # usb-backup.sh — Automated USB Backup for TrueNAS Scale
 # =============================================================================
-# Runs via cron every 10 minutes.
+# Runs via cron every xx minutes, e.g. every 10 minutes (*/10)
 # Detects USB drive by serial number, imports ZPool backup-usb,
 # starts the configured replication task, exports the pool afterward.
 # Enforces a minimum 24h interval between runs.
 #
-# Hardened version:
 # - waits until the ZFS pool is actually visible/importable after USB detection
 # - refuses to replicate if the target pool is not healthy
 # - disables the replication task on failures after it was enabled
