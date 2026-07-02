@@ -340,7 +340,7 @@ Before deploying the script, verify these values on your system:
 ```bash
 # 1. USB drive serial number (with drive connected)
 lsblk -o NAME,SERIAL,TRAN | grep usb
-# → Note the SERIAL value, e.g. ZXA0PGH7
+# → Note the SERIAL value, e.g. <USB_SERIAL>
 
 # 2. Replication Task ID
 midclt call replication.query | python3 -c "
@@ -358,6 +358,15 @@ zpool list
 
 ### 7.2 The Script
 
+> **Required before use**
+> The script below is intentionally shipped with placeholders. Before running it, adjust at least:
+>
+> - `USB_SERIAL` — set this to the serial shown by `lsblk -o NAME,SERIAL,TRAN`
+> - `REPLICATION_ID` — set this to your TrueNAS replication task ID
+> - `ZPOOL_NAME` — adjust if your USB backup pool is not named `backup-usb`
+>
+> The script will refuse to run while `USB_SERIAL="CHANGE_ME_USB_SERIAL"` or `REPLICATION_ID=0` is still configured.
+
 Save as `/mnt/zdata/scripts/usb-backup.sh`:
 
 ```bash
@@ -366,49 +375,178 @@ Save as `/mnt/zdata/scripts/usb-backup.sh`:
 # usb-backup.sh — Automated USB Backup for TrueNAS Scale
 # =============================================================================
 # Runs via cron every 10 minutes.
-# Detects USB drive by serial, imports ZPool, triggers replication,
-# exports pool afterward. 24-hour lock prevents repeated runs.
+# Detects USB drive by serial number, imports ZPool backup-usb,
+# starts the configured replication task, exports the pool afterward.
+# Enforces a minimum 24h interval between runs.
 #
-# CONFIGURATION — adjust these values to your environment:
+# Hardened version:
+# - waits until the ZFS pool is actually visible/importable after USB detection
+# - refuses to replicate if the target pool is not healthy
+# - disables the replication task on failures after it was enabled
+# - verifies replication job lookup and state handling
+# - verifies the pool again before export and after export
 # =============================================================================
 
-USB_SERIAL="ZXA0PGH7"            # Serial number of USB drive (lsblk -o NAME,SERIAL,TRAN | grep usb)
-ZPOOL_NAME="backup-usb"           # Name of USB ZPool
+set -u
+
+# --- Configuration ---
+USB_SERIAL="CHANGE_ME_USB_SERIAL"   # Required: USB drive serial number (lsblk -o NAME,SERIAL,TRAN)
+ZPOOL_NAME="backup-usb"           # Name of the USB ZPool
 ZPOOL_ALTROOT="/mnt"              # TrueNAS mounts ZPools under /mnt
-REPLICATION_ID=4                  # Replication Task ID (midclt call replication.query)
-LOCKFILE="/var/run/usb-backup.lock"
-LASTRUN_FILE="/var/db/usb-backup.lastrun"
-MIN_INTERVAL=$((24 * 3600))       # 24 hours in seconds
+REPLICATION_ID=0                     # Required: TrueNAS Replication Task ID
+LOCKFILE="/var/run/usb-backup.lock"        # Prevents parallel execution
+LASTRUN_FILE="/var/db/usb-backup.lastrun"  # Timestamp of last successful run
+MIN_INTERVAL=$((24 * 3600))       # 24h in seconds
 LOGFILE="/var/log/usb-backup.log"
-MAX_WAIT=$((8 * 3600))            # Maximum wait time for replication job (8h)
-SLEEP_INTERVAL=30                 # Status poll interval in seconds
 
-# =============================================================================
+# Wait/retry behavior
+POOL_IMPORT_WAIT_SECONDS=180      # wait up to 3 minutes for ZFS to see the USB pool
+POOL_IMPORT_SLEEP_SECONDS=10
+JOB_MAX_WAIT=$((24 * 3600))       # maximum wait time for replication job: 24h
+JOB_POLL_INTERVAL=30
+EXPORT_WAIT_SECONDS=60            # wait up to 60s for pool to disappear after export
+EXPORT_POLL_INTERVAL=5
 
+# --- Runtime state ---
+LOCK_CREATED=0
+TASK_ENABLED_BY_SCRIPT=0
+POOL_IMPORTED_BY_SCRIPT=0
+
+# --- Logging ---
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOGFILE"
 }
 
-# --- Precondition: midclt available ---
-if ! command -v midclt &>/dev/null; then
-    log "ERROR: midclt not found — is this TrueNAS Scale?"
-    exit 1
-fi
+cleanup() {
+    RC=$?
 
-# --- Precondition: zpool available ---
-if ! command -v zpool &>/dev/null; then
-    log "ERROR: zpool not found"
-    exit 1
-fi
+    if [ "$TASK_ENABLED_BY_SCRIPT" -eq 1 ]; then
+        log "INFO: Cleanup: disabling Replication Task ID $REPLICATION_ID."
+        midclt call replication.update "$REPLICATION_ID" '{"enabled": false}' >> "$LOGFILE" 2>&1 || \
+            log "WARN: Cleanup: failed to disable Replication Task ID $REPLICATION_ID."
+    fi
 
-# --- Precondition: replication task exists ---
+    if [ "$LOCK_CREATED" -eq 1 ]; then
+        rm -f "$LOCKFILE"
+        log "INFO: Lock file removed."
+    fi
+
+    exit "$RC"
+}
+trap cleanup EXIT
+
+require_command() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        log "ERROR: Required command not found: $1"
+        exit 1
+    fi
+}
+
+pool_is_imported() {
+    zpool list -H -o name "$ZPOOL_NAME" >/dev/null 2>&1
+}
+
+pool_is_importable() {
+    zpool import 2>/dev/null | grep -q "pool: $ZPOOL_NAME"
+}
+
+log_pool_status() {
+    log "INFO: Current ZPool status for '$ZPOOL_NAME':"
+    zpool status -v "$ZPOOL_NAME" >> "$LOGFILE" 2>&1 || true
+}
+
+assert_pool_healthy() {
+    local CONTEXT="$1"
+    local STATUS
+
+    if ! pool_is_imported; then
+        log "ERROR: $CONTEXT: ZPool '$ZPOOL_NAME' is not imported."
+        exit 1
+    fi
+
+    STATUS=$(zpool status -x "$ZPOOL_NAME" 2>&1 || true)
+
+    if echo "$STATUS" | grep -q "pool '$ZPOOL_NAME' is healthy"; then
+        log "INFO: $CONTEXT: ZPool '$ZPOOL_NAME' is healthy."
+        return 0
+    fi
+
+    log "ERROR: $CONTEXT: ZPool '$ZPOOL_NAME' is NOT healthy — replication will not run."
+    echo "$STATUS" >> "$LOGFILE"
+    log_pool_status
+    exit 1
+}
+
+wait_until_pool_visible() {
+    local WAITED=0
+
+    while [ "$WAITED" -le "$POOL_IMPORT_WAIT_SECONDS" ]; do
+        if pool_is_imported; then
+            log "INFO: ZPool '$ZPOOL_NAME' is already imported."
+            return 0
+        fi
+
+        if pool_is_importable; then
+            log "INFO: ZPool '$ZPOOL_NAME' is visible as importable."
+            return 0
+        fi
+
+        log "INFO: USB drive is visible, but ZPool '$ZPOOL_NAME' is not importable yet — waiting ${POOL_IMPORT_SLEEP_SECONDS}s..."
+        sleep "$POOL_IMPORT_SLEEP_SECONDS"
+        WAITED=$((WAITED + POOL_IMPORT_SLEEP_SECONDS))
+    done
+
+    log "ERROR: USB drive is visible, but ZPool '$ZPOOL_NAME' did not become importable within ${POOL_IMPORT_WAIT_SECONDS}s."
+    zpool import >> "$LOGFILE" 2>&1 || true
+    exit 1
+}
+
+export_pool_if_needed() {
+    if ! pool_is_imported; then
+        log "INFO: ZPool '$ZPOOL_NAME' is already exported/not imported."
+        return 0
+    fi
+
+    log "INFO: Exporting ZPool '$ZPOOL_NAME'..."
+    sync
+
+    if ! zpool export "$ZPOOL_NAME" >> "$LOGFILE" 2>&1; then
+        log "WARN: ZPool export failed — pool may still be in use."
+        log_pool_status
+        return 1
+    fi
+
+    local WAITED=0
+    while [ "$WAITED" -le "$EXPORT_WAIT_SECONDS" ]; do
+        if ! pool_is_imported; then
+            log "INFO: ZPool '$ZPOOL_NAME' successfully exported. Drive can be powered off."
+            return 0
+        fi
+        sleep "$EXPORT_POLL_INTERVAL"
+        WAITED=$((WAITED + EXPORT_POLL_INTERVAL))
+    done
+
+    log "WARN: ZPool '$ZPOOL_NAME' export command returned success, but pool still appears imported."
+    log_pool_status
+    return 1
+}
+
+# --- Precondition checks ---
+require_command midclt
+require_command zpool
+require_command zfs
+require_command lsblk
+require_command awk
+require_command python3
+
+# --- Replication task exists check ---
 TASK_EXISTS=$(midclt call replication.query 2>/dev/null | python3 -c "
 import sys, json
 try:
     tasks = json.load(sys.stdin)
-    match = [t for t in tasks if t['id'] == $REPLICATION_ID]
+    match = [t for t in tasks if t.get('id') == $REPLICATION_ID]
     print('yes' if match else 'no')
-except:
+except Exception:
     print('no')
 ")
 if [ "$TASK_EXISTS" != "yes" ]; then
@@ -418,76 +556,97 @@ fi
 
 # --- Lock file check (prevent parallel runs) ---
 if [ -e "$LOCKFILE" ]; then
-    PID=$(cat "$LOCKFILE")
-    if kill -0 "$PID" 2>/dev/null; then
+    PID=$(cat "$LOCKFILE" 2>/dev/null || true)
+    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
         log "INFO: Script already running (PID $PID), exiting."
         exit 0
     else
-        log "WARN: Stale lockfile found, removing."
+        log "WARN: Stale lock file found, removing."
         rm -f "$LOCKFILE"
     fi
 fi
 
-# --- 24h lock check ---
+# --- 24h interval check ---
 if [ -f "$LASTRUN_FILE" ]; then
-    LAST=$(cat "$LASTRUN_FILE")
+    LAST=$(cat "$LASTRUN_FILE" 2>/dev/null || echo 0)
     NOW=$(date +%s)
-    DIFF=$(( NOW - LAST ))
-    if [ "$DIFF" -lt "$MIN_INTERVAL" ]; then
-        REMAINING=$(( MIN_INTERVAL - DIFF ))
-        log "INFO: Last run was $(( DIFF / 3600 ))h $(( (DIFF % 3600) / 60 ))m ago — next run in $(( REMAINING / 3600 ))h $(( (REMAINING % 3600) / 60 ))m."
-        exit 0
+
+    if ! echo "$LAST" | grep -Eq '^[0-9]+$'; then
+        log "WARN: Invalid last-run timestamp in $LASTRUN_FILE — ignoring it."
+    else
+        DIFF=$(( NOW - LAST ))
+        if [ "$DIFF" -lt "$MIN_INTERVAL" ]; then
+            REMAINING=$(( MIN_INTERVAL - DIFF ))
+            log "INFO: Last run was $(( DIFF / 3600 ))h $(( (DIFF % 3600) / 60 ))m ago – next run in $(( REMAINING / 3600 ))h $(( (REMAINING % 3600) / 60 ))m."
+            exit 0
+        fi
     fi
 fi
 
-# --- Check for USB drive ---
-USB_DEV=$(lsblk -o NAME,SERIAL -d 2>/dev/null | awk -v serial="$USB_SERIAL" '$2 == serial {print $1}')
+# --- Check if USB drive is present ---
+USB_DEV=$(lsblk -o NAME,SERIAL -d 2>/dev/null | awk -v serial="$USB_SERIAL" '$2 == serial {print $1; exit}')
 if [ -z "$USB_DEV" ]; then
-    log "INFO: USB drive (Serial: $USB_SERIAL) not found — skipping."
+    log "INFO: USB drive (Serial: $USB_SERIAL) not found – skipping."
     exit 0
 fi
 log "INFO: USB drive found: /dev/$USB_DEV (Serial: $USB_SERIAL)"
 
-# --- Set lockfile ---
+# --- Set lock file only after drive was found and the 24h lock passed ---
 echo $$ > "$LOCKFILE"
-trap 'rm -f "$LOCKFILE"; log "INFO: Lockfile removed."' EXIT
+LOCK_CREATED=1
+
+# --- Wait until the ZFS pool is visible/importable ---
+wait_until_pool_visible
 
 # --- Import ZPool if not already imported ---
-if zpool list "$ZPOOL_NAME" > /dev/null 2>&1; then
+if pool_is_imported; then
     log "INFO: ZPool '$ZPOOL_NAME' is already imported."
-    POOL_WAS_IMPORTED=1
+    POOL_IMPORTED_BY_SCRIPT=0
 else
     log "INFO: Importing ZPool '$ZPOOL_NAME' (altroot: $ZPOOL_ALTROOT)..."
     if ! zpool import -R "$ZPOOL_ALTROOT" "$ZPOOL_NAME" >> "$LOGFILE" 2>&1; then
-        log "ERROR: ZPool import failed — aborting."
+        log "ERROR: ZPool import failed – aborting."
         exit 1
     fi
-    POOL_WAS_IMPORTED=0
+    POOL_IMPORTED_BY_SCRIPT=1
     log "INFO: ZPool '$ZPOOL_NAME' successfully imported."
 fi
+
+# --- Hard stop if target pool is not healthy ---
+assert_pool_healthy "Pre-replication health check"
 
 # --- Enable replication task ---
 log "INFO: Enabling Replication Task ID $REPLICATION_ID..."
 if ! midclt call replication.update "$REPLICATION_ID" '{"enabled": true}' >> "$LOGFILE" 2>&1; then
     log "ERROR: Failed to enable replication task."
-    [ "$POOL_WAS_IMPORTED" -eq 0 ] && zpool export "$ZPOOL_NAME"
+    export_pool_if_needed || true
     exit 1
 fi
+TASK_ENABLED_BY_SCRIPT=1
 
-# --- Start replication job ---
+# --- Start replication task ---
 log "INFO: Starting Replication Task ID $REPLICATION_ID..."
 JOB_ID=$(midclt call replication.run "$REPLICATION_ID" 2>&1)
 if [ $? -ne 0 ]; then
-    log "ERROR: Failed to start replication job: $JOB_ID"
-    midclt call replication.update "$REPLICATION_ID" '{"enabled": false}' >> "$LOGFILE" 2>&1
-    [ "$POOL_WAS_IMPORTED" -eq 0 ] && zpool export "$ZPOOL_NAME"
+    log "ERROR: Failed to start replication task: $JOB_ID"
+    export_pool_if_needed || true
+    exit 1
+fi
+
+if ! echo "$JOB_ID" | grep -Eq '^[0-9]+$'; then
+    log "ERROR: Replication run returned an unexpected Job-ID: $JOB_ID"
+    export_pool_if_needed || true
     exit 1
 fi
 log "INFO: Replication job started, Job-ID: $JOB_ID"
 
 # --- Disable replication task immediately after start ---
 log "INFO: Disabling Replication Task ID $REPLICATION_ID again..."
-midclt call replication.update "$REPLICATION_ID" '{"enabled": false}' >> "$LOGFILE" 2>&1
+if midclt call replication.update "$REPLICATION_ID" '{"enabled": false}' >> "$LOGFILE" 2>&1; then
+    TASK_ENABLED_BY_SCRIPT=0
+else
+    log "WARN: Failed to disable replication task after job start. Cleanup will retry if needed."
+fi
 
 # --- Wait for job completion ---
 log "INFO: Waiting for replication job to complete (ID: $JOB_ID)..."
@@ -499,10 +658,12 @@ import sys, json
 try:
     jobs = json.load(sys.stdin)
     for j in jobs:
-        if j['id'] == $JOB_ID:
-            print(j['state'])
+        if j.get('id') == $JOB_ID:
+            print(j.get('state', 'UNKNOWN'))
             break
-except:
+    else:
+        print('NOT_FOUND')
+except Exception:
     print('UNKNOWN')
 " 2>/dev/null)
 
@@ -512,42 +673,57 @@ except:
             break
             ;;
         FAILED|ABORTED)
-            log "ERROR: Replication job failed (State: $STATUS)."
-            zpool export "$ZPOOL_NAME" >> "$LOGFILE" 2>&1
+            log "ERROR: Replication job failed (state: $STATUS)."
+            midclt call core.get_jobs 2>/dev/null | python3 -c "
+import sys, json
+try:
+    jobs = json.load(sys.stdin)
+    for j in jobs:
+        if j.get('id') == $JOB_ID:
+            print(j)
+            break
+except Exception as e:
+    print(e)
+" >> "$LOGFILE" 2>&1 || true
+            export_pool_if_needed || true
             exit 1
             ;;
         RUNNING|WAITING)
-            log "INFO: Job still running (State: $STATUS, elapsed: ${ELAPSED}s)..."
+            log "INFO: Job still running (state: $STATUS, elapsed: ${ELAPSED}s)..."
+            ;;
+        NOT_FOUND)
+            log "WARN: Replication job ID $JOB_ID not found in core.get_jobs — retrying..."
             ;;
         *)
-            log "WARN: Unknown state: '$STATUS' — retrying..."
+            log "WARN: Unknown state: '$STATUS' – retrying..."
             ;;
     esac
 
-    if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
-        log "ERROR: Timeout after ${MAX_WAIT}s — aborting."
-        zpool export "$ZPOOL_NAME" >> "$LOGFILE" 2>&1
+    if [ "$ELAPSED" -ge "$JOB_MAX_WAIT" ]; then
+        log "ERROR: Timeout after ${JOB_MAX_WAIT}s – aborting."
+        export_pool_if_needed || true
         exit 1
     fi
 
-    sleep "$SLEEP_INTERVAL"
-    ELAPSED=$(( ELAPSED + SLEEP_INTERVAL ))
+    sleep "$JOB_POLL_INTERVAL"
+    ELAPSED=$(( ELAPSED + JOB_POLL_INTERVAL ))
 done
 
+# --- Verify pool health after replication and before export ---
+assert_pool_healthy "Post-replication health check"
+
 # --- Export ZPool ---
-log "INFO: Exporting ZPool '$ZPOOL_NAME'..."
-sync
-if zpool export "$ZPOOL_NAME" >> "$LOGFILE" 2>&1; then
-    log "INFO: ZPool '$ZPOOL_NAME' successfully exported. Drive can be powered off."
-else
-    log "WARN: ZPool export failed — pool may still be in use."
+if ! export_pool_if_needed; then
+    log "ERROR: Pool export could not be verified. Do NOT power off the USB drive yet."
+    exit 1
 fi
 
-# --- Save timestamp for 24h lock ---
+# --- Save timestamp for 24h interval lock only after verified export ---
 date +%s > "$LASTRUN_FILE"
 log "INFO: Last successful run saved. Next run earliest in 24h."
 
 exit 0
+
 ```
 
 ### 7.3 Install the Script
@@ -556,9 +732,15 @@ exit 0
 # Copy to scripts directory on your ZPool (survives TrueNAS updates)
 mkdir -p /mnt/zdata/scripts
 nano /mnt/zdata/scripts/usb-backup.sh
-# → paste script content, adjust USB_SERIAL and REPLICATION_ID
+# → paste script content, then adjust USB_SERIAL, REPLICATION_ID, and ZPOOL_NAME if needed
 
 chmod +x /mnt/zdata/scripts/usb-backup.sh
+
+# Verify syntax before first run
+bash -n /mnt/zdata/scripts/usb-backup.sh
+
+# Verify placeholders have been replaced
+grep -E 'CHANGE_ME_USB_SERIAL|REPLICATION_ID=0' /mnt/zdata/scripts/usb-backup.sh && echo "ERROR: script still contains placeholders" || echo "OK: required placeholders replaced"
 
 # Verify
 ls -la /mnt/zdata/scripts/usb-backup.sh
@@ -572,12 +754,18 @@ Before setting up the cron job, verify the script works correctly by running it 
 
 ### 8.1 Prerequisites
 
+Before the first run, confirm that the script no longer contains placeholders:
+
+```bash
+grep -E 'CHANGE_ME_USB_SERIAL|REPLICATION_ID=0' /mnt/zdata/scripts/usb-backup.sh && echo "ERROR: configure the script first" || echo "OK: script appears configured"
+```
+
 ```bash
 # Ensure USB drive is connected and detected
 lsblk -o NAME,SERIAL,TRAN,SIZE | grep usb
 
 # Ensure pool is NOT yet imported (script should import it itself)
-zpool list backup-usb 2>/dev/null && sudo zpool export backup-usb || echo "2705 Pool not imported 2014 ready"
+zpool list backup-usb 2>/dev/null && sudo zpool export backup-usb || echo "OK: Pool not imported - ready"
 
 # Reset 24h lock if it exists from a previous run
 sudo rm -f /var/db/usb-backup.lastrun
@@ -614,19 +802,19 @@ INFO: Lockfile removed.
 
 ```bash
 # Confirm lastrun file was written
-cat /var/db/usb-backup.lastrun && echo "2705 24h lock is set"
+cat /var/db/usb-backup.lastrun && echo "OK: 24h lock is set"
 
-# Run script again 2014 should exit immediately with 24h message
+# Run script again - should exit immediately with 24h message
 sudo /mnt/zdata/scripts/usb-backup.sh
 tail -3 /var/log/usb-backup.log
-# Expected: INFO: Last run was 0h Xm ago 2014 next run in 23h Xm.
+# Expected: INFO: Last run was 0h Xm ago - next run in 23h Xm.
 ```
 
 ### 8.5 Verify Pool was Exported
 
 ```bash
 # Pool should no longer be imported
-zpool list backup-usb 2>/dev/null || echo "2705 Pool successfully exported by script"
+zpool list backup-usb 2>/dev/null || echo "OK: Pool successfully exported by script"
 ```
 
 > **💡 Tip**
@@ -698,7 +886,7 @@ tail -f /var/log/usb-backup.log
 ### 10.2 Expected Log Output
 
 ```
-2026-06-28 22:00:02 INFO: USB drive found: /dev/sdh (Serial: ZXA0PGH7)
+2026-06-28 22:00:02 INFO: USB drive found: /dev/sdh (Serial: <USB_SERIAL>)
 2026-06-28 22:00:02 INFO: Importing ZPool 'backup-usb' (altroot: /mnt)...
 2026-06-28 22:00:42 INFO: ZPool 'backup-usb' successfully imported.
 2026-06-28 22:00:42 INFO: Enabling Replication Task ID 4...
@@ -733,7 +921,7 @@ tail -20 /var/log/usb-backup.log
 tail -5 /var/log/usb-backup.log
 
 # Expected output:
-# INFO: USB drive (Serial: ZXA0PGH7) not found — skipping.
+# INFO: USB drive (Serial: <USB_SERIAL>) not found — skipping.
 ```
 
 ### 10.5 Test: Full Cron Run — Connect Drive and Observe
@@ -761,7 +949,7 @@ tail -f /var/log/usb-backup.log
 Expected log sequence:
 
 ```
-INFO: USB drive found: /dev/sdh (Serial: ZXA0PGH7)
+INFO: USB drive found: /dev/sdh (Serial: <USB_SERIAL>)
 INFO: Importing ZPool 'backup-usb' (altroot: /mnt)...
 INFO: ZPool 'backup-usb' successfully imported.
 INFO: Enabling Replication Task ID 4...
@@ -800,6 +988,66 @@ for t in tasks:
 
 ---
 
+## 11. Post-Deployment Health Check After Several Runs
+
+> **⚠️ Important**
+> A replication job can complete successfully even when the USB transport path is unstable or the target pool has already recorded ZFS metadata errors. After the first few real backup runs, explicitly check the USB backup pool and kernel logs before trusting the routine.
+
+Run these checks after the first **2–5 successful automated backup cycles**:
+
+```bash
+# Import the pool if it is currently exported
+sudo zpool import -R /mnt backup-usb
+
+# Check ZFS health
+sudo zpool status -v backup-usb
+
+# Check recent ZFS events
+sudo zpool events -v | tail -n 120
+
+# Check for USB/UAS/reset/I/O symptoms
+sudo dmesg -T | egrep -i 'usb|uas|reset|I/O error|failed|medium|sense|cache|Synchronize Cache' | tail -n 200
+
+# Check SMART health of the USB disk
+lsblk -o NAME,SIZE,MODEL,SERIAL,FSTYPE,MOUNTPOINT
+sudo smartctl -a /dev/sdX
+```
+
+Replace `sdX` with the current device name of the USB drive.
+
+A healthy result should show:
+
+```text
+errors: No known data errors
+```
+
+and **no new** kernel messages such as:
+
+```text
+uas_eh_abort_handler
+reset SuperSpeed USB device
+I/O error, dev sdX
+Synchronize Cache(10) failed
+```
+
+If you see permanent ZFS metadata errors such as:
+
+```text
+Permanent errors have been detected in the following files:
+
+        <metadata>:<0x0>
+        <metadata>:<0x3d>
+```
+
+or repeated USB/UAS resets in `dmesg`, stop using the backup pool until the transport problem is fixed.
+
+See the companion troubleshooting guide:
+
+**[TrueNAS USB Backup — USB/UAS Troubleshooting and Recovery](truenas-usb-uas-troubleshooting.md)**
+
+That document describes symptoms, analysis, the `usb-storage.quirks=...` UAS workaround, validation checkpoints, and the safe rebuild of the USB backup pool.
+
+
 ## Troubleshooting
 
 | Problem | Cause | Fix |
@@ -807,7 +1055,8 @@ for t in tasks:
 | `cannot mount`: failed to create mountpoint | ZPool imported without `-R /mnt` | Always use `zpool import -R /mnt backup-usb` |
 | `Task is not enabled` | Replication task disabled, wrong API call | Script handles this: enable → run → disable |
 | Pool state `SUSPENDED` | Drive disconnected while pool was active | `sudo zpool clear backup-usb` then `zpool export backup-usb` |
-| Metadata errors after `zpool clear` | Caused by unclean import/export cycle | Run next replication job — ZFS will repair metadata |
+| Repeated `uas_eh_abort_handler`, USB resets, `I/O error`, or `Synchronize Cache(10) failed` | USB-SATA bridge / UAS / cable / enclosure / passthrough instability | Disable UAS for the affected bridge or replace the enclosure/cable. See [USB/UAS Troubleshooting and Recovery](truenas-usb-uas-troubleshooting.md). |
+| Permanent `<metadata>` errors in `zpool status -v` | USB/UAS reset, unsafe disconnect, or damaged single-disk backup pool metadata | Do **not** continue normal replication. See [USB/UAS Troubleshooting and Recovery](truenas-usb-uas-troubleshooting.md). If errors remain, rebuild the backup pool and run a fresh initial replication. |
 | Script not executable | `/data` or `/usr/local` are read-only on TrueNAS | Store script under `/mnt/zdata/scripts/` |
 | Cron job not running | Wrong user or path | Verify with `midclt call cronjob.query` |
 
@@ -824,4 +1073,4 @@ tail -f /var/log/usb-backup.log
 
 ---
 
-*Last updated: 2026-06-28 | TrueNAS Scale 25.10.4 Goldeye*
+*Last updated: 2026-07-02 | TrueNAS Scale 25.10.4 Goldeye*
